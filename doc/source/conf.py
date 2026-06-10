@@ -351,7 +351,13 @@ collections_final_clean = True
 # The collections config contains a function reference (for the "function" driver)
 # which Sphinx cannot pickle for caching. This is harmless — suppress the warning
 # so it doesn't cause a build failure under -W (warnings-as-errors).
-suppress_warnings = ["config.cache"]
+suppress_warnings = [
+    "config.cache",
+    # sphinxcontrib-redoc (unmaintained, 1.6.0) redundantly copies its bundled
+    # redoc.js asset; Sphinx 8's new copy_overwrite check flags the second copy over
+    # the existing (identical) file. Benign and not fixable upstream.
+    "misc.copy_overwrite",
+]
 # Disable autodoc_pydantic features that can produce empty raw directives
 # (e.g. when schema JSON fails for models with non-serializable fields)
 autodoc_pydantic_model_show_json = False
