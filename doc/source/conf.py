@@ -974,6 +974,26 @@ def setup(app):
 
     logging.getLogger("sphinx").addFilter(DuplicateObjectFilter())
 
+    class CollectionsFootnoteFilter(logging.Filter):
+        # Example notebooks fetched into _collections (from templates.ci.ray.io) contain
+        # prose that myst-parser 5.x parses as reST footnote refs/targets, which docutils
+        # then flags as errors. That content is external (not in this repo), so it can't
+        # be fixed here -- the fix belongs upstream. Drop these specific errors for
+        # _collections paths so the fail_on_warning build is not blocked by fetched content.
+        # TODO: fix the offending footnote-like text upstream and remove this filter.
+        def filter(self, record):
+            msg = record.getMessage()
+            if (
+                "autonumbered footnote references" in msg
+                or "Unknown target name" in msg
+            ):
+                location = str(getattr(record, "location", "") or "")
+                if "_collections" in location:
+                    return False
+            return True
+
+    logging.getLogger("sphinx").addFilter(CollectionsFootnoteFilter())
+
     # Register hook to mark orphan documents
     example_orphan_documents = collect_example_orphans(app.confdir, app.srcdir)
     def mark_orphans(app, docname, _source):
