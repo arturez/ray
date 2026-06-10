@@ -1170,7 +1170,9 @@ def apply_ipython3_lexer(app, docname, source):
     Sphinx + myst-nb otherwise default to the python3 lexer, which fails on
     ``!shell`` and ``%magic`` cells and is fatal under Readthedocs ``-W``.
     """
-    doc_source = app.env.doc2path(docname, base=False)
+    # Sphinx 8 returns a _StrPath from doc2path; coerce to str so the re-based
+    # matchers (compile_matchers) and .endswith below accept it.
+    doc_source = str(app.env.doc2path(docname, base=False))
     if not doc_source.endswith(".ipynb"):
         return
     if any(m(doc_source) for m in app.ipython3_lexer_exclude_patterns):
