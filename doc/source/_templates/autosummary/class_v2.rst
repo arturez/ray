@@ -23,7 +23,7 @@
 
    {% for method in methods | select_api_group(name, module, api_group) %}
       {{ name }}.{{ method }}
-   {% endfor %}
+   {%- endfor %}
 
 {% endfor %}
 {% endif %}
