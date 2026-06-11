@@ -5,9 +5,15 @@ from vllm.distributed.kv_events import ZmqEventPublisher
 
 from ray.llm._internal.serve.core.configs.llm_config import LLMConfig
 from ray.llm._internal.serve.core.server.builder import build_llm_deployment
+from ray.llm._internal.serve.engines.vllm.kv_transfer.factory import (
+    KVConnectorBackendFactory,
+)
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_events import (
+    DYNAMO_KV_CONNECTOR,
+    DYNAMO_KV_CONNECTOR_MODULE_PATH,
     assign_replica_kv_events_endpoint,
     configure_kv_events_for_kv_routing,
+    resolve_consolidator_endpoints,
     resolve_kv_event_source_endpoint,
 )
 from ray.serve.llm.request_router import KVAwareRouter
@@ -45,6 +51,8 @@ class TestConfigureKvEvents:
             "publisher": "zmq",
             "endpoint": "tcp://*:5557",
         }
+        # The Dynamo KVBM connector is not installed in this environment.
+        assert "kv_transfer_config" not in llm_config.engine_kwargs
 
     def test_build_without_kv_aware_router_is_untouched(self):
         llm_config = make_llm_config(
@@ -99,6 +107,36 @@ class TestConfigureKvEvents:
 
         assert user_config.runtime_env["env_vars"]["PYTHONHASHSEED"] == "7"
 
+    def test_dynamo_connector_injected_when_kvbm_installed(self, monkeypatch):
+        """With the kvbm package importable, the Dynamo connector is selected."""
+        monkeypatch.setattr(
+            "ray.llm._internal.serve.routing_policies.kv_aware.kv_events."
+            "importlib.util.find_spec",
+            lambda name: object() if name == "kvbm" else None,
+        )
+        llm_config = make_kv_aware_llm_config()
+        configure_kv_events_for_kv_routing(llm_config)
+
+        assert llm_config.engine_kwargs["kv_transfer_config"] == {
+            "kv_connector": DYNAMO_KV_CONNECTOR,
+            "kv_connector_module_path": DYNAMO_KV_CONNECTOR_MODULE_PATH,
+            "kv_role": "kv_both",
+        }
+
+    def test_user_kv_transfer_config_is_respected(self, monkeypatch):
+        monkeypatch.setattr(
+            "ray.llm._internal.serve.routing_policies.kv_aware.kv_events."
+            "importlib.util.find_spec",
+            lambda name: object(),
+        )
+        user_config = {"kv_connector": "NixlConnector", "kv_role": "kv_both"}
+        llm_config = make_kv_aware_llm_config(
+            engine_kwargs={"kv_transfer_config": dict(user_config)},
+        )
+        configure_kv_events_for_kv_routing(llm_config)
+
+        assert llm_config.engine_kwargs["kv_transfer_config"] == user_config
+
 
 class TestReplicaEndpoints:
     @pytest.fixture
@@ -147,6 +185,62 @@ class TestReplicaEndpoints:
         assert resolve_kv_event_source_endpoint(llm_config) == "tcp://127.0.0.1:5560"
         offset_by_vllm = ZmqEventPublisher.offset_endpoint_port(endpoint, 3)
         assert offset_by_vllm == "tcp://*:5560"
+
+    def test_consolidator_endpoints_with_dynamo_connector(self, replica_rank):
+        """The DynamoConnector backend wires per-replica consolidator
+        endpoints into additional_config and the publisher consumes the
+        consolidated stream."""
+        replica_rank(1)
+        llm_config = make_kv_aware_llm_config(
+            engine_kwargs={
+                "kv_transfer_config": {
+                    "kv_connector": DYNAMO_KV_CONNECTOR,
+                    "kv_connector_module_path": DYNAMO_KV_CONNECTOR_MODULE_PATH,
+                    "kv_role": "kv_both",
+                }
+            },
+        )
+        configure_kv_events_for_kv_routing(llm_config)
+        assign_replica_kv_events_endpoint(llm_config)
+
+        backend = KVConnectorBackendFactory.create_backend(
+            DYNAMO_KV_CONNECTOR, llm_config
+        )
+        backend.setup()
+
+        assert llm_config.engine_kwargs["additional_config"][
+            "consolidator_endpoints"
+        ] == [
+            "tcp://127.0.0.1:5558",
+            "tcp://0.0.0.0:57002",
+            "tcp://127.0.0.1:57002",
+        ]
+        assert resolve_kv_event_source_endpoint(llm_config) == "tcp://127.0.0.1:57002"
+
+    def test_user_consolidator_endpoints_are_respected(self, replica_rank):
+        replica_rank(0)
+        user_endpoints = ["tcp://127.0.0.1:1", "tcp://0.0.0.0:2", "tcp://127.0.0.1:2"]
+        llm_config = make_kv_aware_llm_config(
+            engine_kwargs={
+                "kv_transfer_config": {"kv_connector": DYNAMO_KV_CONNECTOR},
+                "additional_config": {"consolidator_endpoints": user_endpoints},
+            },
+        )
+        configure_kv_events_for_kv_routing(llm_config)
+        assign_replica_kv_events_endpoint(llm_config)
+        KVConnectorBackendFactory.create_backend(
+            DYNAMO_KV_CONNECTOR, llm_config
+        ).setup()
+
+        assert (
+            llm_config.engine_kwargs["additional_config"]["consolidator_endpoints"]
+            is user_endpoints
+        )
+
+    def test_consolidator_requires_kv_events(self):
+        llm_config = make_kv_aware_llm_config()
+        with pytest.raises(ValueError, match="kv_events_config"):
+            resolve_consolidator_endpoints(llm_config)
 
 
 if __name__ == "__main__":

@@ -256,6 +256,8 @@ class VLLMEngine(LLMEngine):
             raise ImportError(
                 "vLLM is not installed. Please install it with `pip install ray[llm]`."
             )
+        # The connector backend setup below derives the KVBM consolidator
+        # endpoints from the KV-events endpoint, so pin it first.
         assign_replica_kv_events_endpoint(self.llm_config)
         self.llm_config.setup_engine_backend()
 
