@@ -52,6 +52,9 @@ from ray.llm._internal.serve.engines.vllm.vllm_models import (
     VLLMEngineConfig,
 )
 from ray.llm._internal.serve.observability.logging import get_logger
+from ray.llm._internal.serve.routing_policies.kv_aware.kv_event_publisher import (
+    maybe_start_kv_event_publisher,
+)
 from ray.llm._internal.serve.routing_policies.kv_aware.kv_events import (
     assign_replica_kv_events_endpoint,
 )
@@ -262,6 +265,7 @@ class VLLMEngine(LLMEngine):
         self.llm_config.setup_engine_backend()
 
         self._running = False
+        self._kv_event_publisher = None
 
         # vLLM Integration points. Will be set through .start()
         self._engine_client = None
@@ -370,6 +374,10 @@ class VLLMEngine(LLMEngine):
 
         self._validate_openai_serving_models()
         self._validate_engine_client()
+
+        self._kv_event_publisher = await maybe_start_kv_event_publisher(
+            self.llm_config, vllm_engine_config.cache_config.block_size
+        )
 
         self._running = True
 

@@ -1,10 +1,18 @@
 import asyncio
 import hashlib
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
 import ray
 from ray import serve
+from ray.llm._internal.serve.routing_policies.kv_aware.kv_event_plane import (
+    configure_kv_event_plane_env,
+    create_kv_event_plane_runtime,
+    dynamo_namespace,
+    kv_events_endpoint_path,
+    reset_kv_event_plane_dir,
+)
 from ray.serve._private.common import DeploymentTargetInfo, ReplicaID
 from ray.serve._private.constants import (
     SERVE_CONTROLLER_NAME,
@@ -32,16 +40,26 @@ class KVRouterActor:
     """Deployment-scoped Ray actor hosting the KV-aware router.
 
     KVRouterActor, independent of any replica's lifetime, is attached to the LLMServer
-    deployment via Serve's DeploymentActorConfig. It exposes the KV-aware routing interfaces:
+    deployment via Serve's DeploymentActorConfig. It owns the deployment's Dynamo
+    ``KvRouter``, whose ``KvEventConsumer`` consumes the replicas' KV events from the
+    event plane into the global KV indexer. It exposes the KV-aware routing interfaces:
     - Replica membership tracking
     - KV-aware scoring
 
-    TODO (jeffreywang): The radix tree that backs them lands in a later PR.
+    TODO (jeffreywang): Scoring routes to Dynamo once ``rank_workers`` lands (RFC §4.4.1).
     """
 
     def __init__(self):
         self._replica_id_by_worker: Dict[int, str] = {}
         self._long_poll_client: Optional[LongPollClient] = None
+        self._kv_router = None
+        self._kv_router_runtime = None
+        self._kv_router_block_size: Optional[int] = None
+        self._replica_by_kv_event_worker: Dict[int, str] = {}
+        # This actor starts with the deployment, before any replica of its
+        # incarnation registers, so it owns clearing the previous
+        # incarnation's discovery state.
+        reset_kv_event_plane_dir(self._kv_event_plane_namespace())
         self._start_replica_tracking()
 
     def _start_replica_tracking(self) -> None:
@@ -77,6 +95,10 @@ class KVRouterActor:
         for worker_id in removed:
             self.remove_worker(worker_id)
             self._replica_id_by_worker.pop(worker_id, None)
+            # A removed replica's KV-event registration goes with it. Keyed
+            # by worker id, not the running set: replicas register while
+            # still STARTING, before they appear in this snapshot.
+            self._replica_by_kv_event_worker.pop(worker_id, None)
         for worker_id in added:
             self._replica_id_by_worker[worker_id] = new[worker_id]
             self.add_worker(worker_id)
@@ -110,6 +132,108 @@ class KVRouterActor:
     def remove_worker(self, worker_id: int) -> None:
         """Deregister a worker from the KV router when a replica is removed."""
         pass
+
+    async def register_kv_event_worker(
+        self, worker_id: int, replica_id: str, kv_block_size: int
+    ) -> None:
+        """Register a replica's KV-event identity before it publishes.
+
+        Called by each replica's ``ReplicaKvEventPublisher`` on startup with
+        the Ray-derived worker id its events are keyed by (RFC §4.3).
+        Instantiates the deployment's ``KvRouter`` on first registration, so
+        its ``KvEventConsumer`` subscribes to the event plane before any event
+        is published.
+        """
+        self._ensure_kv_router(kv_block_size)
+        self._replica_by_kv_event_worker[worker_id] = replica_id
+        logger.info(
+            "Registered KV event worker %d for replica %s (%d registered).",
+            worker_id,
+            replica_id,
+            len(self._replica_by_kv_event_worker),
+        )
+
+    def _ensure_kv_router(self, kv_block_size: int) -> None:
+        """Create the Dynamo ``KvRouter`` consuming this deployment's KV events.
+
+        Lazy: the actor starts before any replica, and the router's block size
+        must match the engines' KV-event block size, which replicas resolve.
+        """
+        # Imported here, not at module scope: Ray pickles this actor class by
+        # value, and Dynamo's pyo3 classes cannot be pickled as its globals.
+        from dynamo.llm import KvRouter, KvRouterConfig
+
+        if self._kv_router is not None:
+            if kv_block_size != self._kv_router_block_size:
+                logger.warning(
+                    "KV event worker registered with block size %d but the "
+                    "KvRouter indexes at block size %d; its events will not "
+                    "match.",
+                    kv_block_size,
+                    self._kv_router_block_size,
+                )
+            return
+
+        namespace = self._kv_event_plane_namespace()
+        configure_kv_event_plane_env(namespace)
+        self._kv_router_runtime = create_kv_event_plane_runtime(
+            asyncio.get_running_loop()
+        )
+        endpoint = self._kv_router_runtime.endpoint(kv_events_endpoint_path(namespace))
+        # durable_kv_events=False: events arrive over the event plane (RFC
+        # §4.3.3), not NATS JetStream.
+        self._kv_router = KvRouter(
+            endpoint=endpoint,
+            block_size=kv_block_size,
+            kv_router_config=KvRouterConfig(
+                use_kv_events=True,
+                durable_kv_events=False,
+            ),
+        )
+        self._kv_router_block_size = kv_block_size
+        logger.info(
+            "Dynamo KvRouter created for namespace %s (block size %d).",
+            namespace,
+            kv_block_size,
+        )
+
+    def _kv_event_plane_namespace(self) -> str:
+        """The Dynamo namespace scoping this deployment's KV events."""
+        return dynamo_namespace(serve.get_deployment_actor_context().deployment_id)
+
+    def get_kv_event_worker_replicas(self) -> Dict[int, str]:
+        """The registered Dynamo worker id -> replica full id mapping."""
+        return dict(self._replica_by_kv_event_worker)
+
+    async def get_kv_indexer_events(self) -> List[Dict[str, Any]]:
+        """The KV events applied to the router's global indexer.
+
+        Dynamo's ``KvRouter.dump_events``: each entry carries the worker id,
+        storage tier, and the stored/removed event payload (block hashes and
+        per-block token hashes). Empty before the router exists.
+        """
+        if self._kv_router is None:
+            return []
+        return json.loads(await self._kv_router.dump_events())
+
+    async def get_kv_event_worker_ids(self) -> List[int]:
+        """Workers with at least one event in the global indexer, sorted."""
+        return sorted(
+            {event["worker_id"] for event in await self.get_kv_indexer_events()}
+        )
+
+    async def get_kv_overlap_blocks(self, token_ids: List[int]) -> Dict[int, int]:
+        """Per-worker device-tier KV overlap blocks for a token sequence.
+
+        The global indexer's view of how many leading blocks of ``token_ids``
+        each worker has cached: the overlap input to KV-aware scoring.
+        """
+        if self._kv_router is None:
+            return {}
+        scores = await self._kv_router.get_overlap_scores(token_ids)
+        return {
+            worker["worker_id"]: worker["device_blocks"] for worker in scores["workers"]
+        }
 
     async def select_worker(
         self,
